@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# Versions present in the `final` environment used for QLoRA training.
+datasets==4.8.5
+trl==1.15.0
+peft==0.21.2
+unsloth @ git+https://github.com/unslothai/unsloth.git@4d28d72802c128193147e954396c5d98586fe2ed
