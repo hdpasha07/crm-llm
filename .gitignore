@@ -1,5 +1,6 @@
 # Local vector databases and source documents
 /vector_db/
+/synthetic_data_pipeline/
 
 # Virtual environments
 /final/
