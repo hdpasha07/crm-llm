@@ -1,51 +1,87 @@
-import streamlit as st
+import os
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Dict, Any
 import requests
-import json
+import time
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 
-st.set_page_config(page_title="Local AI CRM", layout="centered")
-st.title("Local AI CRM Extraction Engine")
+app = FastAPI(title="Local AI CRM API (OpenAI Compatible)")
 
-# Cache the heavy embedding model so the app runs fast
-@st.cache_resource
-def load_retriever():
-    embedding_model = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-    vector_store = Chroma(persist_directory="./crm_chroma_db", embedding_function=embedding_model)
-    return vector_store.as_retriever(search_kwargs={"k": 3})
+print(f"\n⚡ CURRENTLY EXECUTING FILE: {os.path.abspath(__file__)} ⚡\n")
+print("Loading BGE-small and ChromaDB...")
 
-retriever = load_retriever()
+embedding_model = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+vector_store = Chroma(persist_directory="./crm_chroma_db", embedding_function=embedding_model)
+retriever = vector_store.as_retriever(search_kwargs={"k": 3})
 
-query = st.text_input("Enter CRM Query:", placeholder="e.g., What is the refund policy?")
+class ChatRequest(BaseModel):
+    messages: List[Dict[str, Any]]
+    model: str = "qwen-crm"
+    
+    class Config:
+        extra = "ignore" 
 
-if st.button("Extract JSON"):
-    with st.spinner("Retrieving context and querying Qwen..."):
-        # 1. Retrieve Context
-        retrieved_docs = retriever.invoke(query)
-        context = "\n".join([doc.page_content for doc in retrieved_docs])
-        
-        # 2. Build Prompt
-        system_prompt = f"""You are a CRM data extraction assistant. Answer the user's query based on the provided context.
+@app.post("/v1/chat/completions")
+def chat_completions(request: ChatRequest):
+    # 1. Isolate the user's latest query from the OpenAI message array
+    user_query = ""
+    for msg in reversed(request.messages):
+        if msg.get("role") == "user":
+            user_query = msg.get("content", "")
+            break
+            
+    if not user_query:
+        raise HTTPException(status_code=400, detail="No user message found")
+
+    # 2. Retrieve context via BGE-small
+    retrieved_docs = retriever.invoke(user_query)
+    context = "\n".join([doc.page_content for doc in retrieved_docs])
+    
+    # 3. Build the strict JSON extraction prompt
+    system_prompt = f"""You are a CRM data extraction assistant. Answer the user's query based on the provided context.
 Return the extracted information strictly in JSON format.
 
 Context:
 {context}"""
+    
+    payload = {
+        "model": "qwen-crm",
+        "prompt": f"{system_prompt}\n\nQuery: {user_query}",
+        "stream": False,
+        "format": "json"
+    }
+    
+    # 4. Generate with local Ollama
+    try:
+        response = requests.post("http://localhost:11434/api/generate", json=payload)
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Ollama generation failed")
+            
+        raw_json_output = response.json()["response"]
         
-        payload = {
-            "model": "qwen-crm",
-            "prompt": f"{system_prompt}\n\nQuery: {query}",
-            "stream": False,
-            "format": "json"
+        # 5. Return exact OpenAI-formatted response object with token usage
+        return {
+            "id": f"chatcmpl-{int(time.time())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": raw_json_output
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0
+            }
         }
-        
-        # 3. Fetch & Display
-        try:
-            response = requests.post("http://localhost:11434/api/generate", json=payload)
-            if response.status_code == 200:
-                json_output = json.loads(response.json()["response"])
-                st.success("Extraction Complete")
-                st.json(json_output)
-            else:
-                st.error(f"Ollama API Error: {response.status_code}")
-        except Exception as e:
-            st.error(f"Connection failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
